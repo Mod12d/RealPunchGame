@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RealPunchGame – prototype</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0a0a0f;
+      color: #e0e0e0;
+      font-family: 'Courier New', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 { font-size: 1.2rem; letter-spacing: 0.15em; margin-bottom: 12px; color: #ff6040; }
+    canvas {
+      border: 1px solid #333;
+      background: #12121a;
+      touch-action: none;
+    }
+    #controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+      align-items: center;
+      justify-content: center;
+    }
+    label { font-size: 0.8rem; color: #aaa; }
+    input[type=range] { width: 140px; accent-color: #ff6040; }
+    button {
+      background: #1e1e2e;
+      border: 1px solid #444;
+      color: #e0e0e0;
+      padding: 6px 14px;
+      cursor: pointer;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 0.85rem;
+      transition: background 0.15s;
+    }
+    button:hover { background: #2e2e4e; }
+    button.active { background: #ff6040; color: #fff; border-color: #ff6040; }
+    #hud {
+      margin-top: 10px;
+      font-size: 0.8rem;
+      color: #888;
+      text-align: center;
+      line-height: 1.8;
+    }
+    #hud span { color: #ff9f70; font-weight: bold; }
+    #keyhint { font-size: 0.72rem; color: #555; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>REAL PUNCH GAME</h1>
+  <canvas id="c" width="480" height="320"></canvas>
+
+  <div id="controls">
+    <label>speed&nbsp;<input type="range" id="speedSlider" min="1" max="30" value="12" /></label>
+    <button id="btnLeft"  title="F key">LEFT&nbsp;(F)</button>
+    <button id="btnRight" title="J key">RIGHT&nbsp;(J)</button>
+    <button id="btnAuto">Auto-spar ▶</button>
+  </div>
+
+  <div id="hud">
+    punches: <span id="hudCount">0</span> &nbsp;|&nbsp;
+    speed: <span id="hudSpeed">—</span> m/s &nbsp;|&nbsp;
+    level: <span id="hudLevel">1</span>
+  </div>
+  <div id="keyhint">F = left jab &nbsp;·&nbsp; J = right cross &nbsp;·&nbsp; mobile: tap buttons</div>
+
+<script>
+// ─── CONTRACT ────────────────────────────────────────────────────────────────
+/**
+ * @typedef {'left'|'right'} Hand
+ * @typedef {'jab'|'cross'|'hook'|'uppercut'|'unknown'} PunchType
+ *
+ * @typedef {{
+ *   t: number,
+ *   hand: Hand,
+ *   speed: number,
+ *   type?: PunchType,
+ *   dir?: {x:number, y:number, z?:number}
+ * }} PunchEvent
+ *
+ * @typedef {{
+ *   onPunch(handler: (e: PunchEvent) => void): void,
+ *   start(): void,
+ *   stop(): void
+ * }} InputSource
+ */
+
+// ─── MOCK INPUT SOURCE ───────────────────────────────────────────────────────
+class MockInputSource {
+  constructor() {
+    this._handler = null;
+    this._timer   = null;
+  }
+  /** @param {(e: PunchEvent) => void} handler */
+  onPunch(handler) { this._handler = handler; }
+
+  fire(hand, speed) {
+    if (!this._handler) return;
+    /** @type {PunchEvent} */
+    const e = {
+      t:     performance.now(),
+      hand,
+      speed,
+      type:  hand === 'left' ? 'jab' : 'cross',
+    };
+    this._handler(e);
+  }
+
+  startAuto(getSpeed) {
+    if (this._timer) return;
+    const tick = () => {
+      const hand = Math.random() < 0.5 ? 'left' : 'right';
+      this.fire(hand, getSpeed());
+      const wait = 400 + Math.random() * 600;
+      this._timer = setTimeout(tick, wait);
+    };
+    this._timer = setTimeout(tick, 300);
+  }
+
+  stopAuto() {
+    clearTimeout(this._timer);
+    this._timer = null;
+  }
+
+  start() {}
+  stop()  { this.stopAuto(); }
+}
+
+// ─── SESSION STATE ────────────────────────────────────────────────────────────
+const session = { count: 0, level: 1 };
+function updateLevel() {
+  session.level = Math.floor(session.count / 10) + 1;
+}
+
+// ─── CANVAS SETUP ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// ─── STICKMAN GEOMETRY ───────────────────────────────────────────────────────
+const BODY = {
+  cx: W / 2,
+  headR: 22,
+  get headY()   { return H / 2 - 60; },
+  get neckY()   { return H / 2 - 38; },
+  get hipY()    { return H / 2 + 20; },
+  get footLY()  { return H / 2 + 90; },
+  get footRY()  { return H / 2 + 90; },
+  get shoulderLX() { return W / 2 - 30; },
+  get shoulderRX() { return W / 2 + 30; },
+  get shoulderY()  { return H / 2 - 30; },
+};
+
+// ─── ACTIVE PUNCHES (for animation) ──────────────────────────────────────────
+/** @type {{ hand: Hand, speed: number, startT: number, type: PunchType }[]} */
+const activePunches = [];
+
+// ─── HIT EFFECTS ─────────────────────────────────────────────────────────────
+/** @type {{ x: number, y: number, r: number, alpha: number, speed: number, t: number }[]} */
+const effects = [];
+
+function spawnEffect(hand, speed) {
+  const norm  = Math.min(speed / 20, 1);   // 0..1
+  const reach = 80 + norm * 120;            // px
+  const side  = hand === 'left' ? -1 : 1;
+  const x     = BODY.cx + side * reach;
+  const y     = BODY.shoulderY - 10 + (Math.random() - 0.5) * 20;
+  effects.push({ x, y, r: 8 + norm * 28, alpha: 1, speed, t: performance.now() });
+}
+
+// ─── DRAW LOOP ────────────────────────────────────────────────────────────────
+let lastT = 0;
+function draw(now) {
+  requestAnimationFrame(draw);
+  const dt = Math.min(now - lastT, 64);
+  lastT = now;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // grid ghost
+  ctx.strokeStyle = '#1a1a2a';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  drawStickman(now);
+  drawEffects(now, dt);
+}
+
+function drawStickman(now) {
+  ctx.save();
+  ctx.strokeStyle = '#e0e0e0';
+  ctx.lineWidth   = 3;
+  ctx.lineCap     = 'round';
+  ctx.lineJoin    = 'round';
+
+  // head
+  ctx.beginPath();
+  ctx.arc(BODY.cx, BODY.headY, BODY.headR, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // torso
+  line(BODY.cx, BODY.neckY, BODY.cx, BODY.hipY);
+
+  // legs
+  line(BODY.cx, BODY.hipY, BODY.cx - 28, BODY.footLY);
+  line(BODY.cx, BODY.hipY, BODY.cx + 28, BODY.footRY);
+
+  // arms
+  drawArm('left',  now);
+  drawArm('right', now);
+
+  ctx.restore();
+}
+
+function drawArm(hand, now) {
+  // check active punch for this hand
+  const punch = activePunches.find(p => p.hand === hand);
+  const side  = hand === 'left' ? -1 : 1;
+  const sx    = hand === 'left' ? BODY.shoulderLX : BODY.shoulderRX;
+  const sy    = BODY.shoulderY;
+
+  if (!punch) {
+    // rest pose: arm hangs down
+    const ex = sx + side * 10;
+    const ey = sy + 55;
+    line(sx, sy, ex, ey);
+    return;
+  }
+
+  const elapsed = now - punch.startT;
+  const dur     = 220;                         // ms for full extension
+  const norm    = Math.min(elapsed / dur, 1);
+  const ease    = norm < 0.5 ? 2 * norm * norm : -1 + (4 - 2 * norm) * norm;
+
+  const speedNorm = Math.min(punch.speed / 20, 1);
+  const reach     = 70 + speedNorm * 110;
+
+  // extend horizontally (jab/cross), slight upward angle
+  const ex = sx + side * reach * ease;
+  const ey = sy - 10 * ease;
+
+  // elbow midpoint
+  const mx = sx + side * (reach * 0.5) * ease;
+  const my = sy + 15 * (1 - ease);
+
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.quadraticCurveTo(mx, my, ex, ey);
+  ctx.stroke();
+
+  // fist
+  ctx.beginPath();
+  ctx.arc(ex, ey, 5 + speedNorm * 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#ff9f70';
+  ctx.fill();
+
+  // speed lines on extension
+  if (ease > 0.3 && ease < 0.9) {
+    ctx.save();
+    ctx.strokeStyle = `rgba(255,160,80,${(0.9 - ease) * 1.5})`;
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 4; i++) {
+      const oy = (i - 1.5) * 8;
+      const len = 20 + speedNorm * 40;
+      ctx.beginPath();
+      ctx.moveTo(ex - side * len, ey + oy);
+      ctx.lineTo(ex - side * len * 0.3, ey + oy);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+function drawEffects(now, dt) {
+  for (let i = effects.length - 1; i >= 0; i--) {
+    const e = effects[i];
+    const age = now - e.t;
+    e.alpha = Math.max(0, 1 - age / 350);
+    if (e.alpha <= 0) { effects.splice(i, 1); continue; }
+
+    // burst ring
+    ctx.save();
+    ctx.globalAlpha = e.alpha;
+    ctx.strokeStyle = '#ff6040';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.r * (1 + (1 - e.alpha) * 0.8), 0, Math.PI * 2);
+    ctx.stroke();
+
+    // star lines
+    const rays = 6;
+    for (let r = 0; r < rays; r++) {
+      const ang  = (r / rays) * Math.PI * 2 + age * 0.002;
+      const len  = e.r * 0.6 * (1 + (1 - e.alpha));
+      ctx.beginPath();
+      ctx.moveTo(e.x + Math.cos(ang) * e.r * 0.4, e.y + Math.sin(ang) * e.r * 0.4);
+      ctx.lineTo(e.x + Math.cos(ang) * len,        e.y + Math.sin(ang) * len);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+function line(x1, y1, x2, y2) {
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+}
+
+requestAnimationFrame(draw);
+
+// ─── PUNCH HANDLER ───────────────────────────────────────────────────────────
+/** @param {PunchEvent} e */
+function onPunch(e) {
+  // add / replace active punch for this hand
+  const idx = activePunches.findIndex(p => p.hand === e.hand);
+  const entry = { hand: e.hand, speed: e.speed, startT: performance.now(), type: e.type ?? 'unknown' };
+  if (idx >= 0) activePunches[idx] = entry;
+  else          activePunches.push(entry);
+
+  // remove after animation
+  const animDur = 400;
+  setTimeout(() => {
+    const i = activePunches.indexOf(entry);
+    if (i >= 0) activePunches.splice(i, 1);
+  }, animDur);
+
+  spawnEffect(e.hand, e.speed);
+
+  session.count++;
+  updateLevel();
+  document.getElementById('hudCount').textContent = session.count;
+  document.getElementById('hudSpeed').textContent = e.speed.toFixed(1);
+  document.getElementById('hudLevel').textContent = session.level;
+}
+
+// ─── WIRE UP INPUT SOURCE ─────────────────────────────────────────────────────
+const source = new MockInputSource();  // <== SWAP POINT
+source.onPunch(onPunch);
+source.start();
+
+// ─── UI ──────────────────────────────────────────────────────────────────────
+const slider   = document.getElementById('speedSlider');
+const btnLeft  = document.getElementById('btnLeft');
+const btnRight = document.getElementById('btnRight');
+const btnAuto  = document.getElementById('btnAuto');
+let autoOn = false;
+
+function getSpeed() { return parseFloat(slider.value); }
+
+btnLeft.addEventListener('click',  () => source.fire('left',  getSpeed()));
+btnRight.addEventListener('click', () => source.fire('right', getSpeed()));
+
+btnAuto.addEventListener('click', () => {
+  autoOn = !autoOn;
+  btnAuto.textContent = autoOn ? 'Auto-spar ⏹' : 'Auto-spar ▶';
+  btnAuto.classList.toggle('active', autoOn);
+  if (autoOn) source.startAuto(getSpeed);
+  else        source.stopAuto();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (e.key === 'f' || e.key === 'F') source.fire('left',  getSpeed());
+  if (e.key === 'j' || e.key === 'J') source.fire('right', getSpeed());
+});
+</script>
+</body>
+</html>
